@@ -1,0 +1,4 @@
+session.json
+*.db
+config.yaml
+telegram-translator

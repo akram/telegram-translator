@@ -1,0 +1,23 @@
+telegram:
+  # Get these from https://my.telegram.org
+  app_id: 0
+  app_hash: ""
+  phone_number: "+1234567890"
+  session_file: "session.json"
+
+deepl:
+  # Get your API key from https://www.deepl.com/pro-api
+  api_key: ""
+  # Use https://api-free.deepl.com for free tier
+  base_url: "https://api-free.deepl.com"
+
+channels:
+  # Source channel IDs to translate (numeric IDs)
+  sources:
+    - 0
+  # Destination channel/group ID for translated messages
+  destination: 0
+
+languages:
+  source_lang: "AR"
+  target_lang: "FR"
