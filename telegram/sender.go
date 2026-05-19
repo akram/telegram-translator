@@ -54,13 +54,18 @@ func (s *Sender) SendTranslation(ctx context.Context, peer tg.InputPeerClass, te
 	return extractMessageID(updates)
 }
 
-func (s *Sender) ForwardMessages(ctx context.Context, from tg.InputPeerClass, msgIDs []int, to tg.InputPeerClass) ([]int, error) {
-	updates, err := s.api.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+func (s *Sender) ForwardMessages(ctx context.Context, from tg.InputPeerClass, msgIDs []int, to tg.InputPeerClass, topMsgID int) ([]int, error) {
+	req := &tg.MessagesForwardMessagesRequest{
 		FromPeer: from,
 		ID:       msgIDs,
 		ToPeer:   to,
 		RandomID: generateRandomIDs(len(msgIDs)),
-	})
+	}
+	if topMsgID != 0 {
+		req.TopMsgID = topMsgID
+	}
+
+	updates, err := s.api.MessagesForwardMessages(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("forwarding messages: %w", err)
 	}
@@ -117,7 +122,8 @@ func extractMessageIDs(updates tg.UpdatesClass) ([]int, error) {
 func generateRandomIDs(n int) []int64 {
 	ids := make([]int64, n)
 	for i := range ids {
-		ids[i] = int64(i) + 1 // simple deterministic IDs
+		r, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+		ids[i] = r.Int64()
 	}
 	return ids
 }

@@ -2,7 +2,9 @@ package bot
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/gotd/td/tg"
@@ -29,6 +31,9 @@ type Bot struct {
 	userCache map[int64]string
 	// Default topic ID per source channel (for forum groups)
 	defaultTopic map[int64]int
+	// Topic mapping: source topic ID -> destination topic ID (and reverse)
+	topicMap    map[int]int // src topic -> dst topic
+	topicMapRev map[int]int // dst topic -> src topic
 }
 
 func NewBot(
@@ -47,6 +52,8 @@ func NewBot(
 		peerCache:    make(map[int64]*tg.InputPeerChannel),
 		userCache:    make(map[int64]string),
 		defaultTopic: make(map[int64]int),
+		topicMap:     make(map[int]int),
+		topicMapRev:  make(map[int]int),
 	}
 }
 
@@ -54,47 +61,220 @@ func (b *Bot) SetPeer(channelID int64, peer *tg.InputPeerChannel) {
 	b.peerCache[channelID] = peer
 }
 
-// ResolveDefaultTopics fetches forum topics for each source channel and picks the first open one.
-func (b *Bot) ResolveDefaultTopics(ctx context.Context, api *tg.Client) {
+// SyncForumTopics enables forum mode on the destination if needed, then mirrors
+// all source topics into the destination channel.
+func (b *Bot) SyncForumTopics(ctx context.Context, api *tg.Client) error {
 	for _, channelID := range b.cfg.Channels.Sources {
-		peer, err := b.getPeer(channelID)
+		srcPeer, err := b.getPeer(channelID)
 		if err != nil {
 			continue
 		}
 
-		result, err := api.MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
-			Peer:  peer,
-			Limit: 50,
+		// Fetch source topics
+		srcResult, err := api.MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+			Peer:  srcPeer,
+			Limit: 100,
 		})
 		if err != nil {
-			// Not a forum group — no topics needed
-			b.logger.Debug("channel is not a forum or cannot fetch topics",
+			b.logger.Debug("channel is not a forum, skipping topic sync",
 				zap.Int64("channel", channelID),
 				zap.Error(err),
 			)
 			continue
 		}
 
-		for _, topic := range result.Topics {
-			ft, ok := topic.(*tg.ForumTopic)
-			if !ok || ft.Closed || ft.Hidden {
-				continue
+		// Collect source topics
+		var srcTopics []*tg.ForumTopic
+		for _, t := range srcResult.Topics {
+			if ft, ok := t.(*tg.ForumTopic); ok {
+				srcTopics = append(srcTopics, ft)
 			}
-			b.defaultTopic[channelID] = ft.ID
-			b.logger.Info("default topic resolved",
-				zap.Int64("channel", channelID),
-				zap.Int("topic_id", ft.ID),
-				zap.String("title", ft.Title),
-			)
-			break
+		}
+		if len(srcTopics) == 0 {
+			continue
 		}
 
-		if _, ok := b.defaultTopic[channelID]; !ok {
-			b.logger.Warn("no open topic found for forum channel",
-				zap.Int64("channel", channelID),
-			)
+		// Pick default topic (first open one)
+		for _, ft := range srcTopics {
+			if !ft.Closed && !ft.Hidden {
+				b.defaultTopic[channelID] = ft.ID
+				break
+			}
+		}
+
+		// Enable forum on destination if needed
+		dstPeer, err := b.getPeer(b.cfg.Channels.Destination)
+		if err != nil {
+			return err
+		}
+
+		if err := b.enableForum(ctx, api, dstPeer); err != nil {
+			return fmt.Errorf("enabling forum on destination: %w", err)
+		}
+
+		// Fetch existing destination topics
+		dstResult, err := api.MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+			Peer:  dstPeer,
+			Limit: 100,
+		})
+		if err != nil {
+			return fmt.Errorf("fetching destination topics: %w", err)
+		}
+
+		dstByTitle := make(map[string]int)
+		for _, t := range dstResult.Topics {
+			if ft, ok := t.(*tg.ForumTopic); ok {
+				dstByTitle[ft.Title] = ft.ID
+			}
+		}
+
+		// Create missing topics in destination
+		for _, srcTopic := range srcTopics {
+			if srcTopic.Hidden {
+				// Map "General" topic (ID 1) to destination's General (ID 1)
+				b.topicMap[srcTopic.ID] = 1
+				b.topicMapRev[1] = srcTopic.ID
+				continue
+			}
+
+			// Translate the topic title
+			translatedTitle, err := b.translator.Translate(ctx, srcTopic.Title, b.cfg.Languages.SourceLang, b.cfg.Languages.TargetLang)
+			if err != nil || translatedTitle == "" {
+				translatedTitle = srcTopic.Title // fallback to original
+			}
+
+			if dstID, ok := dstByTitle[translatedTitle]; ok {
+				// Topic already exists with translated title
+				b.topicMap[srcTopic.ID] = dstID
+				b.topicMapRev[dstID] = srcTopic.ID
+				b.logger.Info("mapped existing topic",
+					zap.String("src_title", srcTopic.Title),
+					zap.String("dst_title", translatedTitle),
+					zap.Int("src", srcTopic.ID),
+					zap.Int("dst", dstID),
+				)
+				continue
+			}
+
+			// Check if it exists with the original (untranslated) title — rename it
+			if dstID, ok := dstByTitle[srcTopic.Title]; ok {
+				b.topicMap[srcTopic.ID] = dstID
+				b.topicMapRev[dstID] = srcTopic.ID
+
+				// Rename to translated title
+				if translatedTitle != srcTopic.Title {
+					editReq := &tg.MessagesEditForumTopicRequest{
+						Peer:    dstPeer,
+						TopicID: dstID,
+					}
+					editReq.SetTitle(translatedTitle)
+					if _, err := api.MessagesEditForumTopic(ctx, editReq); err != nil {
+						b.logger.Error("renaming topic", zap.String("title", srcTopic.Title), zap.Error(err))
+					} else {
+						b.logger.Info("renamed topic",
+							zap.String("from", srcTopic.Title),
+							zap.String("to", translatedTitle),
+							zap.Int("dst", dstID),
+						)
+					}
+				}
+				continue
+			}
+
+			// Create topic in destination with translated title
+			randID, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+			req := &tg.MessagesCreateForumTopicRequest{
+				Peer:     dstPeer,
+				Title:    translatedTitle,
+				RandomID: randID.Int64(),
+			}
+			if srcTopic.IconColor != 0 {
+				req.SetIconColor(srcTopic.IconColor)
+			}
+			if srcTopic.IconEmojiID != 0 {
+				req.SetIconEmojiID(srcTopic.IconEmojiID)
+			}
+
+			updates, err := api.MessagesCreateForumTopic(ctx, req)
+			if err != nil {
+				// Retry without emoji if Premium is required
+				if strings.Contains(err.Error(), "PREMIUM_ACCOUNT_REQUIRED") {
+					req.Flags.Unset(3) // clear IconEmojiID flag
+					req.IconEmojiID = 0
+					updates, err = api.MessagesCreateForumTopic(ctx, req)
+				}
+				if err != nil {
+					b.logger.Error("creating destination topic",
+						zap.String("title", srcTopic.Title),
+						zap.Error(err),
+					)
+					continue
+				}
+			}
+
+			// Extract created topic ID from updates
+			dstTopicID := extractTopicIDFromUpdates(updates)
+			if dstTopicID != 0 {
+				b.topicMap[srcTopic.ID] = dstTopicID
+				b.topicMapRev[dstTopicID] = srcTopic.ID
+				b.logger.Info("created mirror topic",
+					zap.String("src_title", srcTopic.Title),
+					zap.String("dst_title", translatedTitle),
+					zap.Int("src", srcTopic.ID),
+					zap.Int("dst", dstTopicID),
+				)
+			}
+		}
+
+		b.logger.Info("topic sync complete",
+			zap.Int64("channel", channelID),
+			zap.Int("topics", len(b.topicMap)),
+		)
+	}
+	return nil
+}
+
+func (b *Bot) enableForum(ctx context.Context, api *tg.Client, dstPeer tg.InputPeerClass) error {
+	// First check if forum mode is already enabled by trying to fetch topics
+	_, err := api.MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
+		Peer:  dstPeer,
+		Limit: 1,
+	})
+	if err == nil {
+		b.logger.Info("destination already has forum mode enabled")
+		return nil
+	}
+
+	// Try to enable forum mode
+	dstInputPeer := dstPeer.(*tg.InputPeerChannel)
+	channel := &tg.InputChannel{ChannelID: dstInputPeer.ChannelID, AccessHash: dstInputPeer.AccessHash}
+
+	_, err = api.ChannelsToggleForum(ctx, &tg.ChannelsToggleForumRequest{
+		Channel: channel,
+		Enabled: true,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "CHAT_NOT_MODIFIED") {
+			return nil
+		}
+		return fmt.Errorf("cannot enable forum mode — make sure destination is a supergroup, not a broadcast channel: %w", err)
+	}
+	b.logger.Info("enabled forum mode on destination channel")
+	return nil
+}
+
+func extractTopicIDFromUpdates(updates tg.UpdatesClass) int {
+	switch u := updates.(type) {
+	case *tg.Updates:
+		for _, update := range u.Updates {
+			if upd, ok := update.(*tg.UpdateNewChannelMessage); ok {
+				if msg, ok := upd.Message.(*tg.MessageService); ok {
+					return msg.ID
+				}
+			}
 		}
 	}
+	return 0
 }
 
 func (b *Bot) CacheUsers(users []tg.UserClass) {
@@ -221,7 +401,10 @@ func (b *Bot) HandleSourceMessage(ctx context.Context, api *tg.Client, msg *tg.M
 	link := fmt.Sprintf("https://t.me/c/%d/%d", channelID, msg.ID)
 
 	// Extract forum topic ID from the source message
-	topMsgID := extractTopMsgID(msg)
+	srcTopicID := extractTopMsgID(msg)
+
+	// Resolve destination topic (mirror)
+	dstTopicID := b.topicMap[srcTopicID]
 
 	// Determine reply-to in destination channel (thread replication)
 	var dstReplyTo int
@@ -235,7 +418,7 @@ func (b *Bot) HandleSourceMessage(ctx context.Context, api *tg.Client, msg *tg.M
 
 	if hasMedia {
 		// Forward the media message first
-		fwdIDs, err := b.sender.ForwardMessages(ctx, srcPeer, []int{msg.ID}, dstPeer)
+		fwdIDs, err := b.sender.ForwardMessages(ctx, srcPeer, []int{msg.ID}, dstPeer, dstTopicID)
 		if err != nil {
 			return fmt.Errorf("forwarding media: %w", err)
 		}
@@ -256,11 +439,10 @@ func (b *Bot) HandleSourceMessage(ctx context.Context, api *tg.Client, msg *tg.M
 				replyTo = dstReplyTo
 			}
 
-			captionMsgID, err := b.sender.SendTranslation(ctx, dstPeer, formattedMsg, replyTo, 0)
+			captionMsgID, err := b.sender.SendTranslation(ctx, dstPeer, formattedMsg, replyTo, dstTopicID)
 			if err != nil {
 				return fmt.Errorf("sending caption translation: %w", err)
 			}
-			// Use the caption message as the mapping target
 			if captionMsgID != 0 {
 				dstMsgID = captionMsgID
 			}
@@ -281,7 +463,7 @@ func (b *Bot) HandleSourceMessage(ctx context.Context, api *tg.Client, msg *tg.M
 			if i > 0 {
 				replyTo = dstMsgID // chain split messages
 			}
-			sentID, err := b.sender.SendTranslation(ctx, dstPeer, part, replyTo, 0)
+			sentID, err := b.sender.SendTranslation(ctx, dstPeer, part, replyTo, dstTopicID)
 			if err != nil {
 				return fmt.Errorf("sending translation part %d: %w", i, err)
 			}
@@ -298,7 +480,7 @@ func (b *Bot) HandleSourceMessage(ctx context.Context, api *tg.Client, msg *tg.M
 			SrcMsgID:     msg.ID,
 			DstChannelID: b.cfg.Channels.Destination,
 			DstMsgID:     dstMsgID,
-			TopMsgID:     topMsgID,
+			TopMsgID:     srcTopicID,
 		}); err != nil {
 			b.logger.Error("saving mapping", zap.Error(err))
 		}
@@ -323,19 +505,14 @@ func (b *Bot) HandleDestinationMessage(ctx context.Context, api *tg.Client, msg 
 	// Find which source channel and message to reply to
 	var srcChannelID int64
 	var srcReplyTo int
-	var topMsgID int
+	var srcTopicID int
 
 	if replyTo, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && replyTo.ReplyToMsgID != 0 {
 		mapping, _ := b.store.LookupByDestination(channelID, replyTo.ReplyToMsgID)
 		if mapping != nil {
 			srcChannelID = mapping.SrcChannelID
 			srcReplyTo = mapping.SrcMsgID
-			topMsgID = mapping.TopMsgID
-
-			// If topMsgID is missing (old mapping), try to fetch it from the source message
-			if topMsgID == 0 && api != nil {
-				topMsgID = b.fetchTopMsgID(ctx, api, srcChannelID, srcReplyTo)
-			}
+			srcTopicID = mapping.TopMsgID
 		}
 	}
 
@@ -344,10 +521,20 @@ func (b *Bot) HandleDestinationMessage(ctx context.Context, api *tg.Client, msg 
 		srcChannelID = b.cfg.Channels.Sources[0]
 	}
 
-	// Use default topic for standalone messages in forum groups
-	if topMsgID == 0 {
+	// For standalone messages, resolve source topic from destination topic
+	if srcTopicID == 0 {
+		dstTopicID := extractTopMsgID(msg)
+		if dstTopicID != 0 {
+			if st, ok := b.topicMapRev[dstTopicID]; ok {
+				srcTopicID = st
+			}
+		}
+	}
+
+	// Fallback to default topic
+	if srcTopicID == 0 {
 		if dt, ok := b.defaultTopic[srcChannelID]; ok {
-			topMsgID = dt
+			srcTopicID = dt
 		}
 	}
 
@@ -362,12 +549,12 @@ func (b *Bot) HandleDestinationMessage(ctx context.Context, api *tg.Client, msg 
 		return fmt.Errorf("getting source peer: %w", err)
 	}
 
-	sentID, err := b.sender.SendTranslation(ctx, srcPeer, translated, srcReplyTo, topMsgID)
+	sentID, err := b.sender.SendTranslation(ctx, srcPeer, translated, srcReplyTo, srcTopicID)
 	if err != nil {
 		if strings.Contains(err.Error(), "TOPIC_CLOSED") {
 			b.logger.Warn("topic is closed, cannot reply",
 				zap.Int64("channel", srcChannelID),
-				zap.Int("topic", topMsgID),
+				zap.Int("topic", srcTopicID),
 			)
 			return nil
 		}

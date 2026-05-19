@@ -15,8 +15,11 @@ channels:
   # Source channel IDs to translate (numeric IDs)
   sources:
     - 0
-  # Destination channel/group ID for translated messages
+  # Destination group ID for translated messages
+  # Set to 0 to auto-create a forum group named after the source with a flag emoji
   destination: 0
+  # Rename destination group to match source name + target language flag (default: true)
+  # override_group_name: false
 
 languages:
   source_lang: "AR"

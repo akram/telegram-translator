@@ -14,15 +14,17 @@ type Translator struct {
 	apiKey  string
 	baseURL string
 	client  *http.Client
+	cache   *Cache
 }
 
-func NewTranslator(apiKey, baseURL string) *Translator {
+func NewTranslator(apiKey, baseURL string, cache *Cache) *Translator {
 	return &Translator{
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		cache: cache,
 	}
 }
 
@@ -41,6 +43,13 @@ type translateResponse struct {
 func (t *Translator) Translate(ctx context.Context, text, sourceLang, targetLang string) (string, error) {
 	if text == "" {
 		return "", nil
+	}
+
+	// Check cache first
+	if t.cache != nil {
+		if cached, ok := t.cache.Get(text, sourceLang, targetLang); ok {
+			return cached, nil
+		}
 	}
 
 	reqBody := translateRequest{
@@ -88,7 +97,14 @@ func (t *Translator) Translate(ctx context.Context, text, sourceLang, targetLang
 		return "", fmt.Errorf("no translations returned")
 	}
 
-	return result.Translations[0].Text, nil
+	translated := result.Translations[0].Text
+
+	// Store in cache
+	if t.cache != nil {
+		t.cache.Put(text, sourceLang, targetLang, translated)
+	}
+
+	return translated, nil
 }
 
 type usageResponse struct {

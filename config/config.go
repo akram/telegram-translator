@@ -29,8 +29,9 @@ type DeepLConfig struct {
 }
 
 type ChannelsConfig struct {
-	Sources     []int64 `yaml:"sources"`
-	Destination int64   `yaml:"destination"`
+	Sources            []int64 `yaml:"sources"`
+	Destination        int64   `yaml:"destination"`
+	OverrideGroupName  *bool   `yaml:"override_group_name,omitempty"`
 }
 
 type LanguagesConfig struct {
@@ -108,6 +109,10 @@ func setDefaults(cfg *Config) {
 	if cfg.Languages.TargetLang == "" {
 		cfg.Languages.TargetLang = "FR"
 	}
+	if cfg.Channels.OverrideGroupName == nil {
+		t := true
+		cfg.Channels.OverrideGroupName = &t
+	}
 }
 
 func validate(cfg *Config) error {
@@ -126,8 +131,6 @@ func validate(cfg *Config) error {
 	if len(cfg.Channels.Sources) == 0 {
 		return fmt.Errorf("channels.sources must have at least one channel")
 	}
-	if cfg.Channels.Destination == 0 {
-		return fmt.Errorf("channels.destination is required")
-	}
+	// destination is optional — will be auto-created if 0
 	return nil
 }
